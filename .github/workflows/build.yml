@@ -1,0 +1,57 @@
+name: build
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 19 1 * *"
+
+concurrency: osrm
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      IMAGE: ghcr.io/project-osrm/osrm-backend@sha256:e1929ae2818226284d7ef007329098a30851c11528ab3712bc9c8d68da78278b
+      PBF_URL: https://download.geofabrik.de/asia/vietnam-latest.osm.pbf
+      DATA: /mnt/osrm
+    steps:
+      - name: Swap
+        run: |
+          sudo fallocate -l 8G /mnt/osrm.swap
+          sudo chmod 600 /mnt/osrm.swap
+          sudo mkswap /mnt/osrm.swap
+          sudo swapon /mnt/osrm.swap
+          free -h
+          df -h /mnt
+
+      - name: Download
+        run: |
+          sudo mkdir -p "$DATA" && sudo chown "$USER" "$DATA"
+          curl -fsSL --retry 3 -o "$DATA/vietnam-latest.osm.pbf" "$PBF_URL"
+          ls -lh "$DATA"
+
+      - name: Extract
+        run: docker run --rm -v "$DATA:/data" "$IMAGE" osrm-extract -p /opt/car.lua /data/vietnam-latest.osm.pbf
+
+      - name: Partition
+        run: docker run --rm -v "$DATA:/data" "$IMAGE" osrm-partition /data/vietnam-latest.osrm
+
+      - name: Customize
+        run: docker run --rm -v "$DATA:/data" "$IMAGE" osrm-customize /data/vietnam-latest.osrm
+
+      - name: Deploy
+        env:
+          SSH_KEY: ${{ secrets.OSRM_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.OSRM_KNOWN_HOSTS }}
+          HOST: ${{ secrets.OSRM_HOST }}
+          PORT: ${{ secrets.OSRM_PORT }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/osrm && chmod 600 ~/.ssh/osrm
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh_cmd="ssh -i $HOME/.ssh/osrm -o IdentitiesOnly=yes -p $PORT"
+          name=$(date -u +%Y%m%d-%H%M%S)
+          sudo chown -R "$USER" "$DATA"
+          rsync -az --partial --exclude '*.pbf' -e "$ssh_cmd" "$DATA/" "root@$HOST:/srv/osrm/incoming/$name/"
+          $ssh_cmd "root@$HOST" "activate $name"
